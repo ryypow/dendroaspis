@@ -1,0 +1,29 @@
+# Privilege escalation TracingPolicy for Mamba behavioral telemetry
+# Captures credential changes from LXC containers (excludes host events)
+# Deploy to <YOUR_HOST>: cp privilege-monitor.yaml /etc/tetragon/tetragon.tp.d/
+#
+# Key use cases:
+#   - setuid/setgid detection
+#   - Capability changes (capset)
+#   - Privilege escalation attack detection (T1548)
+
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "privilege-monitor"
+spec:
+  kprobes:
+    # Credential commit — ALL credential changes flow through this function
+    # Covers: setuid, setgid, setreuid, setresuid, capset, execve with suid bit
+    # Tetragon extracts uid, gid, and capabilities from the cred struct
+    - call: "commit_creds"
+      syscall: false
+      args:
+        - index: 0
+          type: "cred"      # credential struct — uid, gid, caps
+      selectors:
+        - matchNamespaces:
+            - namespace: "Pid"
+              operator: "NotIn"
+              values:
+                - "host_ns"

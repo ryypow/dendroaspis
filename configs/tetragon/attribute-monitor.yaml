@@ -1,0 +1,41 @@
+# File attribute monitoring TracingPolicy for Mamba behavioral telemetry
+# Captures chmod / permission changes from LXC containers (excludes host events)
+# Deploy to <YOUR_HOST>: cp attribute-monitor.yaml /etc/tetragon/tetragon.tp.d/
+#
+# Key use cases:
+#   - Payload preparation (T1222 File and Directory Permissions Modification)
+#   - Classic attack chain: curl payload -> chmod +x -> execute
+#
+# Behavioral signal rationale:
+#   chmod_common is the single kernel function all permission-change syscalls
+#   (chmod, fchmod, fchmodat) flow through. Capturing it gives the Mamba model
+#   a "preparation" state that precedes execution. Sequences like
+#   (network, connect) -> (file, write) -> (file, modify[chmod +x]) -> (system, process, spawn)
+#   are a high-signal attack-chain pattern that is much easier for an SSM to
+#   flag than the exec event in isolation.
+
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "attribute-monitor"
+spec:
+  kprobes:
+    # File permission / mode change (T1222)
+    # Parser maps this to (file, file, modify) with mode bits in evidence.
+    # Evidence field captures the mode so downstream logic can identify
+    # grants of the execute bit (0o111) specifically.
+    # NOTE: chmod_common's mode arg is kernel type umode_t (16-bit unsigned).
+    # uint16 silences the type-mismatch warning Tetragon emits on load.
+    - call: "chmod_common"
+      syscall: false
+      args:
+        - index: 0
+          type: "path"      # target file path
+        - index: 1
+          type: "uint16"    # new mode bits (umode_t)
+      selectors:
+        - matchNamespaces:
+            - namespace: "Pid"
+              operator: "NotIn"
+              values:
+                - "host_ns"

@@ -1,0 +1,7 @@
+# Runtime — pinned to versions used for the paper's experiments
+numpy==2.4.4
+pyarrow==23.0.1
+PyYAML==6.0.3
+torch==2.10.0
+scikit-learn==1.8.0
+xgboost==3.2.0

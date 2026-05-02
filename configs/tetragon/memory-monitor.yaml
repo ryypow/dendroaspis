@@ -1,0 +1,39 @@
+# Memory monitoring TracingPolicy for Mamba behavioral telemetry
+# Detects fileless execution and in-memory attack techniques from LXC containers
+# Deploy to <YOUR_HOST>: cp memory-monitor.yaml /etc/tetragon/tetragon.tp.d/
+#
+# Key use cases:
+#   - Fileless malware (shellcode injection into anonymous executable memory)
+#   - Process hollowing (unmap legitimate code, map malicious code)
+#   - Living-off-the-land (reflective DLL/SO loading)
+#   - MITRE ATT&CK: T1055 (Process Injection), T1620 (Reflective Code Loading)
+
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "memory-monitor"
+spec:
+  kprobes:
+    # Memory-mapped file operations — LSM hook that fires on mmap calls
+    # Captures both file-backed mappings (normal .so loads) and anonymous
+    # executable mappings (fileless execution signal).
+    # The file arg is null for anonymous mappings — the parser uses this
+    # to distinguish normal library loads from suspicious in-memory execution.
+    - call: "security_mmap_file"
+      syscall: false
+      args:
+        - index: 0
+          type: "file"      # file struct (null for anonymous mappings)
+        - index: 1
+          type: "uint32"    # protection flags (PROT_READ=1, PROT_WRITE=2, PROT_EXEC=4)
+      selectors:
+        - matchNamespaces:
+            - namespace: "Pid"
+              operator: "NotIn"
+              values:
+                - "host_ns"
+          matchArgs:
+            - index: 1
+              operator: "Mask"
+              values:
+                - "4"        # PROT_EXEC — only capture mappings with execute permission

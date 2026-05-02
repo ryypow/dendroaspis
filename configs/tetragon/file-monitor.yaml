@@ -1,0 +1,46 @@
+# File monitoring TracingPolicy for Mamba behavioral telemetry
+# Captures file opens and deletes from LXC containers (excludes host events)
+# Deploy to <YOUR_HOST>: cp file-monitor.yaml /etc/tetragon/tetragon.tp.d/
+#
+# Key use cases:
+#   - ART marker detection (/tmp/art_start_*, /tmp/art_end_*)
+#   - File access patterns for behavioral modeling
+#   - Sensitive file access (e.g., /etc/shadow, /etc/passwd)
+
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "file-monitor"
+spec:
+  kprobes:
+    # File open — fires when a file descriptor is installed (successful open)
+    # Tetragon extracts the full file path from the kernel file struct
+    - call: "fd_install"
+      syscall: false
+      args:
+        - index: 0
+          type: "int"       # file descriptor number
+        - index: 1
+          type: "file"      # file struct — Tetragon extracts path
+      selectors:
+        - matchNamespaces:
+            - namespace: "Pid"
+              operator: "NotIn"
+              values:
+                - "host_ns"
+
+    # File delete — fires on unlink/unlinkat syscall
+    # Captures file path being deleted
+    - call: "do_unlinkat"
+      syscall: false
+      args:
+        - index: 0
+          type: "int"       # directory fd
+        - index: 1
+          type: "string"    # pathname
+      selectors:
+        - matchNamespaces:
+            - namespace: "Pid"
+              operator: "NotIn"
+              values:
+                - "host_ns"

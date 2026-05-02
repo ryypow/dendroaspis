@@ -1,0 +1,82 @@
+# Process injection monitoring TracingPolicy for Mamba behavioral telemetry
+# Captures ptrace, mprotect (RX/RWX flips), and process_vm_writev from LXC containers
+# Deploy to <YOUR_HOST>: cp injection-monitor.yaml /etc/tetragon/tetragon.tp.d/
+#
+# Key use cases:
+#   - Process injection via ptrace (T1055.008)
+#   - Shellcode activation via RW->RX mprotect flip (T1055)
+#   - Cross-process memory write injection (T1055.009)
+#
+# Behavioral signal rationale:
+#   memory-monitor.yaml captures mmap(PROT_EXEC) — naive in-memory execution.
+#   Sophisticated attackers evade that by allocating RW, writing payload, then
+#   flipping the page to RX via mprotect. security_file_mprotect with a
+#   PROT_EXEC mask catches that evasion path. Filtering on PROT_EXEC keeps
+#   the event volume sane — routine mprotect calls (heap management, PROT_NONE
+#   guard pages) are ignored.
+
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "injection-monitor"
+spec:
+  kprobes:
+    # Process debugging and ptrace-based injection (T1055.008)
+    # request arg identifies PTRACE_ATTACH, PTRACE_POKEDATA, PTRACE_DETACH, etc.
+    # Parser maps this to action=trace (v1.3 schema).
+    # NOTE: Tetragon's kprobe type vocabulary does not include "long" — use int64.
+    - call: "sys_ptrace"
+      syscall: true
+      args:
+        - index: 0
+          type: "int64"     # ptrace request (PTRACE_ATTACH=16, POKEDATA=5, etc.)
+        - index: 1
+          type: "int"       # target PID
+      selectors:
+        - matchNamespaces:
+            - namespace: "Pid"
+              operator: "NotIn"
+              values:
+                - "host_ns"
+
+    # Memory protection flip (T1055)
+    # Only fires when PROT_EXEC is being requested — captures the RW->RX
+    # shellcode activation pattern. Parser maps this to action=protect (v1.3).
+    #
+    # NOTE: security_file_mprotect's first arg is a struct vm_area_struct*
+    # which Tetragon's kprobe type vocabulary does not expose directly.
+    # We skip arg[0] and only extract the protection flags — Tetragon still
+    # captures the calling process's identity from event metadata.
+    - call: "security_file_mprotect"
+      syscall: false
+      args:
+        - index: 1
+          type: "uint64"    # reqprot (requested protection flags)
+        - index: 2
+          type: "uint64"    # prot (actual protection applied)
+      selectors:
+        - matchNamespaces:
+            - namespace: "Pid"
+              operator: "NotIn"
+              values:
+                - "host_ns"
+          matchArgs:
+            - index: 1
+              operator: "Mask"
+              values:
+                - "4"       # PROT_EXEC — only capture flips granting execute
+
+    # Cross-process memory write (T1055.009)
+    # Faster injection path that does not require PTRACE_ATTACH.
+    # Parser maps this to action=write with object_type=process.
+    - call: "sys_process_vm_writev"
+      syscall: true
+      args:
+        - index: 0
+          type: "int"       # target PID
+      selectors:
+        - matchNamespaces:
+            - namespace: "Pid"
+              operator: "NotIn"
+              values:
+                - "host_ns"

@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# Dataset (download from Hugging Face — see README)
+data/
+
+# Training/eval outputs
+artifacts/
+*.pt
+*.ckpt
+
+# Paper sources are kept private; only the compiled main.pdf ships
+paper/*.tex
+paper/*.bib
+paper/*.cls
+paper/*.bst
+paper/Makefile
+paper/sections/
+paper/figures/
+paper/main.aux
+paper/main.bbl
+paper/main.blg
+paper/main.fdb_latexmk
+paper/main.fls
+paper/main.log
+paper/main.out
+paper/main.synctex.gz
+paper/main.toc
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp

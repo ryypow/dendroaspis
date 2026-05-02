@@ -1,0 +1,25 @@
+# Logrotate config for Tetragon JSON event stream on <YOUR_HOST>.
+# Install to: /etc/logrotate.d/tetragon
+#
+# Rotation strategy:
+#   - Rotate daily OR when file exceeds 500MB (whichever first)
+#   - Keep 14 compressed rotations (~2 weeks of history)
+#   - copytruncate avoids Tetragon needing to reopen the file
+#     (Tetragon writes via append — truncate-in-place is safe)
+#
+# Install:
+#   sudo cp mamba-edge/config/tetragon/logrotate.tetragon /etc/logrotate.d/tetragon
+#   sudo logrotate -d /etc/logrotate.d/tetragon   # dry-run to verify
+#   sudo logrotate -f /etc/logrotate.d/tetragon   # force initial rotation
+
+/var/log/tetragon/events.json {
+    daily
+    maxsize 500M
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    create 0640 root root
+}

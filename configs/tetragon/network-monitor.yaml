@@ -1,0 +1,80 @@
+# Network monitoring TracingPolicy for Mamba behavioral telemetry
+# Captures TCP connections and DNS queries from LXC containers (excludes host events)
+# Deploy to <YOUR_HOST>: cp network-monitor.yaml /etc/tetragon/tetragon.tp.d/
+#
+# Key use cases:
+#   - C2 callback detection (unusual outbound connections)
+#   - Lateral movement detection
+#   - DNS resolution monitoring (normal domains vs C2/DGA domains)
+#   - Normal network behavior baseline
+
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "network-monitor"
+spec:
+  kprobes:
+    # Outbound TCP connection — fires when a TCP connection is initiated
+    # Tetragon extracts src/dst IP:port from the sock struct
+    - call: "tcp_connect"
+      syscall: false
+      args:
+        - index: 0
+          type: "sock"      # socket struct — Tetragon extracts family, src/dst IP:port
+      selectors:
+        - matchNamespaces:
+            - namespace: "Pid"
+              operator: "NotIn"
+              values:
+                - "host_ns"
+
+    # TCP connection close — captures connection lifecycle end
+    # Useful for connection duration analysis
+    - call: "tcp_close"
+      syscall: false
+      args:
+        - index: 0
+          type: "sock"      # socket struct
+      selectors:
+        - matchNamespaces:
+            - namespace: "Pid"
+              operator: "NotIn"
+              values:
+                - "host_ns"
+
+    # Inbound TCP accept — fires when a listening socket accepts a connection
+    # Detects services receiving connections (e.g., reverse shells, bind shells)
+    - call: "inet_csk_accept"
+      syscall: false
+      return: true
+      returnArg:
+        index: 0
+        type: "sock"        # accepted socket with peer info
+      selectors:
+        - matchNamespaces:
+            - namespace: "Pid"
+              operator: "NotIn"
+              values:
+                - "host_ns"
+
+    # DNS queries — captures UDP sends to port 53
+    # High-signal for C2 detection: model learns normal resolution patterns
+    # (github.com, apt repos) vs anomalous (DGA domains, unusual resolvers)
+    - call: "udp_sendmsg"
+      syscall: false
+      args:
+        - index: 0
+          type: "sock"      # socket struct — dst IP:port
+        - index: 1
+          type: "int"       # message length
+      selectors:
+        - matchNamespaces:
+            - namespace: "Pid"
+              operator: "NotIn"
+              values:
+                - "host_ns"
+          matchArgs:
+            - index: 0
+              operator: "DPort"
+              values:
+                - "53"
