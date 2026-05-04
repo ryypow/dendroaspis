@@ -1,10 +1,48 @@
 """Tetragon-native parser.
 
-Implements §4 of docs/releases/v0.2-course-milestone/v0.2_design_plan.md.
+It reads the ~140 tetragon events.json.gz files collected for this experiment. Each line in each events.json file is one kernel event
+-The tetragon trace policies (config/tetragon) controls the event types to collect.
+    - the trace policies were designed to collect the events that can provide the model enough information to determine if there is an attack taking place
 
-Stateless: each input file processed independently. Stats accumulate across
-parse_file() calls within a single parser instance and reset only when the
-parser is recreated.
+-Filtering:
+    -the container used in this experiment by its INUM (specific to my homelab proxmox)
+        - Since there were additional containers deployed on the proxmox host, this parser filters for
+        - by default, tetragon traces EVERY process on the host by default (including all containers and the proxmox host itself), which is why the container filter is necessary.
+
+    - "sentinel intervals":
+        - time windows during which the lab was being set up, smoke-tested, and testing the atomic red team setup/configuration
+        - none of these attacks are included in the training or evaluation set
+
+    - any events missing an actual process binary:
+        - rows (each row being a kernel event) missing a process binary are useless for the model training so there is no need to include them
+
+After the events are filtered, the parser pulls out the fields used in the encoder. This is where the attack signal resides.
+Custom trace policies: the tetragon eBPF probes that monitor for the defined kernel functions
+- kernel probes (kprobe): the "tripwire" that triggers event collection. 
+    - everytime a program/process wants to do something, it has to go through the kernel
+    - the kprobe is like the "hidden camera" that collects the events for the functions defined in the tetragon trace policies
+    - no malicious process or package can avoid the kernel - it will see everything, regardless of how an attacker tries to obfuscate their attack
+
+- for this experiment, we are monitoring the following kernel functions:
+        - fd_install: catches file opens, dropped payloads, and freshly created sockets in one place
+        - commit_creds: ground-truth privilege-escalation tripwire: setuid binaries, sudo, exploits that flip a process to UID 0
+        - tcp_close: Fires when a TCP socket is torn down. Pairs with tcp_connect / inet_csk_accept
+        - udp_sendmsg: Fires on every outbound UDP datagram. Captures addresses, ports, and message length. Catches DNS queries (so DNS-tunneling C2 shows up here), NTP, and any custom UDP-based exfil
+        - inet_csk_accept: Fires when a process accepts an inbound TCP connection
+            - Key signal for reverse shells dialing back, bind shells, and unauthorized listeners
+        - do_unlinkat: fires when a file is deleted. Primary signal for log wiping, evidence destruction, and ransomware cleanup of originals after encryption.
+        - chmod_common: Fires whenever a file's permission bits change, with the path and the new mode. Catches "drop a payload then make it executable"
+        - security_file_mprotect: LSM hook that gates mprotect — the syscall that changes the protection bits on an already-mapped memory region
+        - sys_ptrace: fires on ptrace syscalls:
+            - Used legitimately by debuggers (gdb, strace), and used maliciously for code injection, credential theft (reading another process's memory), and anti-debug evasion
+        - sys_process_vm_writev:  Fires when one process writes directly into another process's memory via process_vm_writev
+            - if triggered, it's a strong signal for cross-process code/data injection
+
+Default event types tetragon collects regardless of trace policy config:
+- process_exec/process_exit: when a process starts/ends
+    - this is used to trace process lineage
+    - this is how we understand where events originated from
+    - shows attack signal for the chained attacks like: file-download -> chmod +x -> process execute -> data exfiltration
 """
 
 from __future__ import annotations
@@ -23,11 +61,11 @@ from .tetragon_native_writer import PARSER_VERSION, SCHEMA
 
 log = logging.getLogger(__name__)
 
+#the target containers namespace inums: ignoring the other containers present on the proxmox host
 DEFAULT_TARGET_PID_NS_INUMS: frozenset[int] = frozenset({4026533329, 4026533387})
 
 # Sentinel intervals to exclude from the output parquet.
 # Events whose top-level `time` falls inside any (start, end) tuple are dropped.
-# Per docs/releases/v0.2-course-milestone/v0.2_design_plan.md §1.9 / §4.11.
 DEFAULT_SENTINEL_INTERVALS: tuple[tuple[str, str, str], ...] = (
     ("2026-04-19T07:54:00Z", "2026-04-19T09:40:00Z", "setup_listener_shakedown"),
     ("2026-04-19T09:40:00Z", "2026-04-19T10:15:00Z", "T1195.002_dry_run_99"),
@@ -51,8 +89,8 @@ KPROBE_FUNCTIONS = (
 )
 
 
-# ---------- timestamp parsing ----------
-
+#timestamp parsing: converts the the tetragon event timestamp into nanoseconds since the unix epoch (January 1, 1970)
+#timestamps (in nanoseconds) are stored as int64
 def parse_tetragon_ts(ts: str | None) -> int | None:
     """Parse Tetragon RFC3339-with-nanoseconds-and-Z to int64 ns since epoch."""
     if not ts or not isinstance(ts, str) or not ts.endswith("Z"):
@@ -74,7 +112,7 @@ def parse_tetragon_ts(ts: str | None) -> int | None:
     return int(dt.timestamp()) * 1_000_000_000 + ns_frac
 
 
-# ---------- empty-row template ----------
+#empty-row template
 
 _EMPTY_ROW: dict = {f.name: None for f in SCHEMA}
 
@@ -83,7 +121,8 @@ def _empty_row() -> dict:
     return dict(_EMPTY_ROW)
 
 
-# ---------- config ----------
+#config:
+#NOTE: scoped to the target containers namespace inums specific to the proxmox host (two of them, due to container respawn)
 
 class TetragonNativeParserConfig:
     def __init__(
@@ -122,7 +161,41 @@ class TetragonNativeParserConfig:
         )
 
 
-# ---------- process-block extraction (Groups B, C, D / E) ----------
+#process-block extraction
+""" 
+Builds the per-event parquet schema.
+- each tetragon event comes wrapped in a process dictionary describing the process that triggered the event
+- this function takes the dictionary and flattens it into a bunch of columns suitable for a parquet row
+- called twice per event: once for the process itself (prefix "proc_") and once for its parent (prefix "parent_"),
+  so a single row carries both sides of the lineage
+
+Each event contains:
+ - process identity: proc_pid, proc_binary, proc_uid, proc_arguments, proc_cwd
+     - exec_id / parent_exec_id are the stable lineage keys (PIDs get reused, exec_ids do not)
+     - auid is the original login uid preserved across su/sudo — divergence from uid is itself a priv-esc signal
+
+ - flags: proc_flag_execve, proc_flag_clone, proc_flag_rootcwd, proc_is_procfs_walk
+     - flag_execve / flag_clone tell you whether this process arrived via execve or fork/clone
+     - is_procfs_walk marks execs that tetragon backfilled by walking /proc at startup
+       (real exec happened earlier; the encoder backdates event_time to start_time for these)
+
+ - timing: proc_start_time (int64 ns since epoch)
+     - lets the encoder compute process age at event time
+
+ - capabilities: proc_cap_permitted, proc_cap_effective, proc_cap_inheritable
+     - linux's fine-grained replacement for binary root/non-root
+     - effective = active right now; permitted = ceiling; inheritable = passed across execve
+
+ - namespaces: proc_ns_{pid,mnt,net,user,uts,ipc,cgroup}_inum (+ is_host for pid/user/time)
+     - the inum fields are how the container filter scopes events to the target LXC
+     - is_host distinguishes host-namespace events from container-namespace events
+
+ - credentials: proc_creds_{uid,gid,euid,egid,suid,sgid,fsuid,fsgid}
+     - linux tracks four parallel uid/gid sets (real, effective, saved-set, filesystem)
+     - matched values = normal; divergence = setuid binary mid-exec or active priv manipulation
+
+All of the above is mirrored under the parent_ prefix for the parent process block.
+"""
 
 def _flag_tokens(flags_str: str | None) -> set[str]:
     if not flags_str:
@@ -131,7 +204,6 @@ def _flag_tokens(flags_str: str | None) -> set[str]:
 
 
 def _extract_process_block(proc: dict, prefix: str, event_type: str) -> dict:
-    """Extract Group B + C + D fields from a process block dict."""
     out: dict = {}
     if not proc:
         return out
@@ -139,7 +211,6 @@ def _extract_process_block(proc: dict, prefix: str, event_type: str) -> dict:
     flags_str = proc.get("flags") or ""
     tokens = _flag_tokens(flags_str)
 
-    # Group B
     out[f"{prefix}exec_id"] = proc.get("exec_id")
     out[f"{prefix}parent_exec_id"] = proc.get("parent_exec_id")
     out[f"{prefix}pid"] = proc.get("pid")
@@ -154,19 +225,18 @@ def _extract_process_block(proc: dict, prefix: str, event_type: str) -> dict:
     out[f"{prefix}in_init_tree"] = bool(proc.get("in_init_tree", False))
     out[f"{prefix}refcnt"] = proc.get("refcnt")
 
-    # Group C
     out[f"{prefix}is_procfs_walk"] = ("procFS" in tokens) and (event_type == "process_exec")
     out[f"{prefix}flag_execve"] = "execve" in tokens
     out[f"{prefix}flag_clone"] = "clone" in tokens
     out[f"{prefix}flag_rootcwd"] = "rootcwd" in tokens
 
-    # Group D — caps
+    #capabilities
     cap = proc.get("cap") or {}
     out[f"{prefix}cap_permitted"] = cap.get("permitted") or []
     out[f"{prefix}cap_effective"] = cap.get("effective") or []
     out[f"{prefix}cap_inheritable"] = cap.get("inheritable") or []
 
-    # Group D — namespaces
+    #namespaces
     ns = proc.get("ns") or {}
     for ns_name in ("pid", "mnt", "net", "user", "uts", "ipc", "cgroup"):
         block = ns.get(ns_name) or {}
@@ -175,7 +245,7 @@ def _extract_process_block(proc: dict, prefix: str, event_type: str) -> dict:
         block = ns.get(ns_name) or {}
         out[f"{prefix}ns_{ns_name}_is_host"] = bool(block.get("is_host", False))
 
-    # Group D — process_credentials
+    #process_credentials
     creds = proc.get("process_credentials") or {}
     for k in ("uid", "gid", "euid", "egid", "suid", "sgid", "fsuid", "fsgid"):
         out[f"{prefix}creds_{k}"] = creds.get(k)
@@ -183,8 +253,17 @@ def _extract_process_block(proc: dict, prefix: str, event_type: str) -> dict:
     return out
 
 
-# ---------- kprobe arg extractors ----------
+#kprobe arg extractor
+"""
+Twelve functions, one per kprobe defined in trace policies
+- each arg field is a positional list of argument wrappers
+- each element is a one-key dict, like {"int_arg": 5}, {"file_arg": {...}}, {"sock_arg": {...}}
+- drops any args that are not expected (truncated, )
+"""
 
+# -----------file descriptor installation--------
+# mirrors kernel signature: fd_install(unsigned int fd, struct file *file)
+# if a process opens /etc/shadow or drops a payload at /tmp/x, this is where you see the path and the mode bits at install time
 def _kp_fd_install(args: list) -> dict:
     out: dict = {}
     if len(args) >= 1 and isinstance(args[0], dict) and "int_arg" in args[0]:
@@ -198,7 +277,9 @@ def _kp_fd_install(args: list) -> dict:
         out["kp_fd_install_permission"] = f.get("permission")
     return out
 
-
+# ------------ file-backed memory mapping-----------
+# Signature: security_mmap_file(file, prot, flags)
+# captures the file being mapped and the protection bits requested at mmap time
 def _kp_security_mmap_file(args: list) -> dict:
     out: dict = {}
     if len(args) >= 1 and isinstance(args[0], dict) and "file_arg" in args[0]:
@@ -215,7 +296,9 @@ def _kp_security_mmap_file(args: list) -> dict:
                 break
     return out
 
-
+# --------- credential transition -------------
+#takes one struct of new credentials
+#Tetragon unpacks the entire thing — all four UID/GID sets, the new effective capability list, and the user namespace the creds belong to
 def _kp_commit_creds(args: list) -> dict:
     out: dict = {}
     if not args or not isinstance(args[0], dict):
@@ -232,7 +315,10 @@ def _kp_commit_creds(args: list) -> dict:
     out["kp_creds_user_ns_is_host"] = bool(user_ns.get("is_host", False))
     return out
 
-
+# ------------ helper for the four network probes------------
+# iterates across tcp_connect, tcp_close, inet_csk_accept, udp_sendmsg
+# enables the reconstruction of a full network 4-tuple: (saddr, sport, daddr, dport) plus protocol family and TCP state
+# The cookie cast to str is because socket cookies are 64-bit unsigned integers that overflow Parquet's int64 column
 def _extract_sock(args: list) -> dict:
     out: dict = {}
     for a in args:
@@ -267,7 +353,9 @@ def _kp_tcp_close(args: list) -> dict:
 def _kp_inet_csk_accept(args: list) -> dict:
     return _extract_sock(args)
 
-
+# udp_sendmsg: standard sock fields plus the size of the datagram payload
+# Message length is the dominant signal for DNS-tunneling C2
+#abnormally large UDP/53 payloads stand out hard against normal DNS traffic
 def _kp_udp_sendmsg(args: list) -> dict:
     out = _extract_sock(args)
     for a in args:
@@ -279,7 +367,9 @@ def _kp_udp_sendmsg(args: list) -> dict:
             break
     return out
 
-
+# -----------file deletion---------
+# Signature: do_unlinkat(dfd, name)
+# dirfd is the directory the path is relative to (AT_FDCWD = -100 means "relative to cwd")
 def _kp_do_unlinkat(args: list) -> dict:
     out: dict = {}
     if len(args) >= 1 and isinstance(args[0], dict) and "int_arg" in args[0]:
@@ -298,7 +388,10 @@ def _kp_do_unlinkat(args: list) -> dict:
                 break
     return out
 
-
+# -------------permission-bit changes---------
+# captures the path, the old mode (_before), and the new mode being requested
+# lets the model see the delta betwen permission changes
+# like 0644 → 0755 (added executable)
 def _kp_chmod_common(args: list) -> dict:
     out: dict = {}
     if len(args) >= 1 and isinstance(args[0], dict) and "file_arg" in args[0]:
@@ -315,7 +408,9 @@ def _kp_chmod_common(args: list) -> dict:
                 break
     return out
 
-
+#---------- memory protection changes--------
+# accumulates all numeric args into a list and takes the first two
+# reqprot is what the process asked for; prot is what the LSM ultimately allowed
 def _kp_security_file_mprotect(args: list) -> dict:
     out: dict = {}
     vals = []
@@ -335,7 +430,10 @@ def _kp_security_file_mprotect(args: list) -> dict:
         out["kp_mprotect_prot"] = vals[1]
     return out
 
-
+#------------debugger / injection syscall---------
+#captures the ptrace operation code and the target PID
+#the request code is the benign/attack discriminator
+#PTRACE_ATTACH (attach to victim) and PTRACE_POKEDATA (write into victim's memory) provide attack signal
 def _kp_sys_ptrace(args: list) -> dict:
     out: dict = {}
     if len(args) >= 1 and isinstance(args[0], dict):
@@ -356,7 +454,8 @@ def _kp_sys_ptrace(args: list) -> dict:
                 break
     return out
 
-
+#----------direct cross-process memory write-----
+#captures writes to the target containers processes
 def _kp_sys_process_vm_writev(args: list) -> dict:
     out: dict = {}
     if len(args) >= 1 and isinstance(args[0], dict):
@@ -386,8 +485,7 @@ KPROBE_EXTRACTORS = {
 }
 
 
-# ---------- parser ----------
-
+#parser
 class TetragonNativeParser:
     """Stateless Tetragon JSONL → row-dict parser.
 
@@ -398,7 +496,7 @@ class TetragonNativeParser:
         self.config = config
         self.stats: Counter[str] = Counter()
 
-    # --- container filter ---
+    #container filter: filters for the monitored LXC container by cgroup/inum
 
     def _passes_container_filter(self, proc: dict) -> bool:
         ns = (proc.get("ns") or {}).get("pid") or {}
@@ -460,36 +558,32 @@ class TetragonNativeParser:
 
         row = _empty_row()
 
-        # Group A
+        # event type/time and node name extraction
         row["event_type"] = event_type
         row["event_time"] = event_time_ns
         row["node_name"] = raw.get("node_name") or self.config.node_name
 
-        # Groups B + C + D for source process
+        # source process fields
         row.update(_extract_process_block(proc, "proc_", event_type))
 
-        # Tag-not-drop procfs-walk execs per design plan
-        # (plan_archive/tetragon_native_parquet_rebuild.md:393, :436) and
-        # V.5-redo evidence in tetragon-dataset-validation.ipynb cells 17-23
-        # (~28K procFS-flagged events fall inside ART intervals; they are not
-        # startup-only). Dropping breaks lineage for pre-Tetragon processes
-        # and deletes real attack-window signal. The proc_is_procfs_walk flag
-        # survives on the row; downstream consumers (encoder f_is_procfs_walk)
-        # use it to discount backdated event_time on these specific rows.
-        # Only process_exec carries a meaningful procfs-walk tag; exit/kprobe
-        # paths clear the flag below per §1.11. The kept-tag counter fires
-        # at row-finalize time (see tagged_procfs_walk_execs below).
+        """
+        NOTE: I tagged procfs-walk execs due to dropping breaking the lineage/ancestor trace
+        for tetragon processes.
 
-        # Groups B + C + D for parent process (mirrors B-D per §2.2 line 303)
+        IN v1, dropping these broke the lineage between processes and dropped events within attack intervals
+
+        The encoder uses it for backdated event_times on the rows with proc_is_procfs_walk= true
+        
+        """
         parent = inner.get("parent") or {}
         row.update(_extract_process_block(parent, "parent_", event_type))
 
-        # Group F + G — event-type-specific
+        #event-type-specific
         if event_type == "process_exit":
             row["exit_status"] = inner.get("status")
             row["exit_signal"] = inner.get("signal")
             if row["proc_is_procfs_walk"]:
-                row["proc_is_procfs_walk"] = False  # only execs get tagged per §1.11
+                row["proc_is_procfs_walk"] = False
             if row["parent_is_procfs_walk"]:
                 row["parent_is_procfs_walk"] = False
         elif event_type == "process_kprobe":
@@ -510,6 +604,7 @@ class TetragonNativeParser:
                         source_file, source_line, fn, e,
                     )
             try:
+                #captures full args blob for field recovery, incase the extractor functions missed a field
                 row["kprobe_args_json"] = json.dumps(args, separators=(",", ":"))
             except (TypeError, ValueError):
                 self.stats["errors_extraction"] += 1
@@ -519,7 +614,7 @@ class TetragonNativeParser:
             if row["parent_is_procfs_walk"]:
                 row["parent_is_procfs_walk"] = False
 
-        # Group H
+        # provenance/metadata
         row["_source_file"] = source_file
         row["_source_line"] = source_line
         row["_parser_version"] = self.config.parser_version

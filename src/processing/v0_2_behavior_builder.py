@@ -1,26 +1,29 @@
 """v0.2 behavior builder.
 
 Reads a raw normalized parquet (output of TetragonNativeWriter) and
-augments it with model + analysis features per Plan G:
+augments it with model + analysis features:
 
-  - 7 model columns: f_action_family, f_lineage_depth,
+- 7 model columns: f_action_family, f_lineage_depth,
     f_parent_child_pair_hash, f_root_ancestor_basename_hash,
     f_process_tree_id_hash, f_delta_t_log_bucket, f_process_age_log_bucket
-  - 14 side columns (strings / bools / raw int64) for analysis + debug:
+  
+- 14 side columns (strings / bools / raw int64) for analysis + debug:
     proc_binary_basename, parent_binary_basename, proc_cwd_sanitized,
     root_ancestor_basename, process_tree_root_exec_id, parent_child_pair,
     path_category, dst_ip_category, dst_port_category, object_category,
     lineage_parent_fallback_used, lineage_missing_parent,
     lineage_cycle_detected, token, delta_t_prev_ns, process_age_ns
-  - The existing 33 f_* features via _build_feature_table
+
+- The existing 33 f_* features via _build_feature_table
 
 Lineage walks the (proc_exec_id -> proc_parent_exec_id) graph globally,
-which is why this is a separate stage from the parser (the parser only
-sees one file at a time and cannot resolve parents that lived in earlier
+which is why this is a separate stage from the parser 
+- (the parser only sees one events.json file at a time and cannot resolve parents that lived in earlier
 files).
 
-Tokens use categories only — never raw IPs or paths. See
-~/.claude/plans/v0.2-final-feature-design.md for the full design.
+Tokens use categories only — never raw IPs or paths
+
+
 """
 
 from __future__ import annotations
@@ -37,9 +40,20 @@ import pyarrow.parquet as pq
 
 from src.features.v0_2_features import _build_feature_table, _hash_to_bucket
 
-
-# ---------- enums ----------
-
+"""
+Categorical features
+ACTION_FAMILY(15): fuses (event_type, kprobe_function) into one semantic action token.
+    -14 tokens + OTHER (15 total). Primary categorical input to the encoder.
+    - example:
+        -raw event: process_kprobe + tcp_connect
+            - action_family = NET_CONNECT
+OBJECT(8): coarser "what kind of thing did the action touch" axis. 8 tokens.
+PATH_CATEGORY(11): bucket for filesystem paths via prefix match (VSCODE_DEV, /etc/, /tmp/, …).
+    - Order in _PATH_BUCKETS matters — more-specific prefixes go first.
+DST_IP_CATEGORY / DST_PORT_CATEGORY(6): bucket network destination by IP class and port role
+"""
+# kprobe category tokenization
+#every event gets collapsed from its raw shape (event_Type + kprobe function) down to one of these action tokens
 ACTION_FAMILY_VOCAB: tuple[str, ...] = (
     "PROC_EXEC",
     "PROC_EXIT",
@@ -59,11 +73,7 @@ ACTION_FAMILY_VOCAB: tuple[str, ...] = (
 ACTION_FAMILY_OOV: str = "OTHER"
 ACTION_FAMILY_OOV_INDEX: int = len(ACTION_FAMILY_VOCAB)  # 14
 
-# Total integer cardinality of f_action_family is len(VOCAB) + 1 to leave
-# room for the OOV row at index ACTION_FAMILY_OOV_INDEX (= 14). The Plan E
-# encoder MUST size its embedding as Embedding(ACTION_FAMILY_CARDINALITY, ...)
-# = Embedding(15, ...). Sizing it to 14 will produce IndexError on any
-# unrecognized event_type / kprobe_function combination.
+#cardinality: 14 action tokens + 1 (other, if an event does not get categorized)
 ACTION_FAMILY_CARDINALITY: int = len(ACTION_FAMILY_VOCAB) + 1  # 15
 
 _ACTION_FAMILY_INDEX: dict[str, int] = {name: i for i, name in enumerate(ACTION_FAMILY_VOCAB)}
@@ -98,13 +108,6 @@ _KPROBE_TO_OBJECT: dict[str, str] = {
     "security_file_mprotect": "MEMORY",
 }
 
-# 3a' — promoted-to-model-feature categorical vocabularies. Ordered enums
-# include every value the corresponding ``derive_*`` function can produce,
-# regardless of whether the value was observed in any specific corpus.
-# Sized to the design vocab, not the observed-in-train counts, so the
-# encoder embedding table does not crash on a value the test (or future)
-# corpus exercises that train didn't.
-
 PATH_CATEGORY_VOCAB: tuple[str, ...] = (
     "VSCODE_DEV", "SENSITIVE_SYS", "TEMP_STAGING", "RUNTIME",
     "LIBRARY", "USR_BIN", "OPT",
@@ -132,20 +135,17 @@ _DST_PORT_CATEGORY_INDEX: dict[str, int] = {v: i for i, v in enumerate(DST_PORT_
 _OBJECT_CATEGORY_INDEX: dict[str, int] = {v: i for i, v in enumerate(OBJECT_CATEGORY_VOCAB)}
 
 # OOV indices for any value the deriver might emit that's not in the vocab
-# (defensive; should not happen given the deriver functions are closed).
 _PATH_CATEGORY_OOV: int = _PATH_CATEGORY_INDEX["OTHER"]
 _DST_IP_CATEGORY_OOV: int = _DST_IP_CATEGORY_INDEX["NONE"]
 _DST_PORT_CATEGORY_OOV: int = _DST_PORT_CATEGORY_INDEX["NONE"]
 _OBJECT_CATEGORY_OOV: int = _OBJECT_CATEGORY_INDEX["OTHER"]
 
-# Path category prefix table. Order matters: more-specific buckets come
-# first. VSCODE_DEV must precede USER_HOME because vscode-server paths live
-# under /home/. PROC_SELF is special-cased before the loop because
-# /proc/self/ is a substring of the RUNTIME prefix /proc/. SENSITIVE_SYS
-# precedes LIBRARY/USR_BIN because /usr/sbin/ is a more sensitive bucket
-# than the generic /usr/lib or /usr/bin and we want it called out
-# distinctly. LIBRARY / USR_BIN / OPT split out the previously-OTHER
-# bucket which audit cell 29 showed to be 30.7% of train events.
+"""
+Path → category prefix table. derive_path_category() iterates this in order
+    - returns the first label whose prefix appears anywhere in the path
+    - load-bearing: more-specific buckets come first so they win over generic ones
+To add a category: insert the (label, prefixes) tuple at the right priority and add the label to PATH_CATEGORY_VOCAB.
+"""
 _PATH_BUCKETS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("VSCODE_DEV", (".vscode-server/", "node_modules/", ".git/")),
     ("SENSITIVE_SYS", ("/etc/", "/root/", "/boot/", "/usr/sbin/", "/sbin/")),
@@ -308,7 +308,7 @@ class LineageWalker:
         self.process_map: dict[str, tuple[str | None, str]] = {}
         # exec_id -> (depth, root_exec_id, root_basename, cycle_detected)
         self._cache: dict[str, tuple[int, str | None, str, bool]] = {}
-        # 3a' diagnostic: counts events where the same exec_id was seen
+        # diagnostic: counts events where the same exec_id was seen
         # twice. proc_exec_id is supposed to be globally unique (Tetragon
         # hashes pid + ns + time), so a non-zero value either means a hash
         # collision or that a process emitted multiple process_exec rows
@@ -349,6 +349,8 @@ class LineageWalker:
             return self._cache[exec_id]
 
         visited: set[str] = set()
+        #cur = cursor -- pointer to keep track of where it currently is
+        # holds the exec_id as the lineage is traced to ancestor processes
         cur: str | None = exec_id
         depth = 0
         cycle = False
@@ -405,11 +407,21 @@ class LineageWalker:
 
 # ---------- bucketing helpers ----------
 
+#this compreses the continuous nanosecond timestamp into a small discrete bucket-id
+#uses log to reliably scale the time deltas
+# used for delta_t_log_bucket (time since last event for same process) and process_age (how old process is)
+
 def log_bucket_ns(value_ns: int | None, num_buckets: int = 10) -> int:
     """Log-bucket a non-negative ns value into 0..num_buckets-1.
 
     Bucket 0 = None / non-positive. Higher buckets correspond to
     log10(ns)+1, capped at num_buckets-1.
+
+    bucket 2: [10,100] - tens of nanoseconds
+    bucket3: [100, 1000] - hundreds of nanoseconds
+    bucket4: [1000, 10000] - 1-20 microseconds
+    ...
+    bucket8: [10000000, 100000000]: 10-100 milliseconds
     """
     if value_ns is None or value_ns <= 0:
         return 0
@@ -419,9 +431,7 @@ def log_bucket_ns(value_ns: int | None, num_buckets: int = 10) -> int:
 
 def _normalize_cwd(cwd: str | None) -> str:
     """Normalize a cwd string: lowercase + ensure trailing slash. NOT a
-    redaction step — usernames and other identifiers are preserved. The
-    column name reflects this; a real sanitization pass (PII redaction) is
-    a separate concern for any dataset-release work.
+    redaction step — usernames and other identifiers are preserved.
     """
     if not cwd:
         return ""
@@ -430,7 +440,14 @@ def _normalize_cwd(cwd: str | None) -> str:
         s = s + "/"
     return s
 
+"""
+TODO:
+- an an additional feature column to capture both binary path and cwd for an exec
+    - will allow model to learn "binary in /tmp" and "cwd in /home"
 
+- potential bug: this can return "OTHER" since it doesnt reach parent_* fields
+    - the path_category will not determine if a benign event (normal location) has a parent in a suspicious location
+"""
 def _path_for_category(
     kp_path: str | None,
     event_type: str | None,
@@ -444,15 +461,35 @@ def _path_for_category(
       2. proc_binary for process_exec — captures /tmp/payload-style staging
          that proc_cwd alone misses.
       3. proc_cwd as a final fallback for everything else.
+    If proc_cwd, function returns "NONE"
     """
-    if kp_path:
+    if kp_path: #event_Type agnostic with respect to which kprobe path it received
         return kp_path
-    if event_type == "process_exec" and proc_binary:
+    if event_type == "process_exec" and proc_binary: #where the parent shell was sitting when initiated
         return proc_binary
-    return proc_cwd
+    return proc_cwd #catch all: for non-file kprobes and process_exit
 
 
-# ---------- main builder (streaming) ----------
+# ---------- lineage construction ----
+"""
+Resolves lineage of events, building a global exec_id -> (parent, basename)
+    - scans parquet and finds the canonical parent of a rows process
+
+_populate_lineage_map(): ingest paruqet into a walker
+    - walks the parquet and finds the earliest registration of a particular exec_id
+    - first-write-wins: the same exec_id can appear in many rows (one per event the process emitted)
+        - the earliest registration of that exec_id is the ancestor -- the first event of the particular process
+
+_build_lineage_map(): for multi-parquet scanning
+
+_resolve_parent_basename(): per-row lookup
+    - gets called once per row on the second pass through the parquet
+    - map lookup: gives the parent name across every row with the same parent exec_id (from _populate_lineage_map()
+    - fallback: if the parent isnt in the map, use the parent_binary feature value
+
+"""
+
+
 
 _ID_COLS_FOR_LINEAGE: tuple[str, ...] = (
     "proc_exec_id",
@@ -497,7 +534,6 @@ def _build_lineage_map(
     _populate_lineage_map(walker, pf, batch_size)
     return walker
 
-
 def _resolve_parent_basename(
     walker: LineageWalker,
     proc_parent_exec_id: str | None,
@@ -511,7 +547,6 @@ def _resolve_parent_basename(
     if parent_id and parent_id in walker.process_map:
         return walker.process_map[parent_id][1]
     return fallback_basename
-
 
 def _derive_batch_columns(
     batch_table: pa.Table,

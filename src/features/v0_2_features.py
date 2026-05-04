@@ -1,33 +1,27 @@
-"""v0.2 feature encoders (Tier 1-6) + ``build_features`` orchestrator.
+"""v0.2 feature encoders
 
-Spec: docs/releases/v0.2-course-milestone/v0.2_tetragon_feature_engineering.md §5
-+ §7.1 (Phase 1).
+Turns the human-readable raw parquet into fixed-width, all-int matrix
+Function roles:
+    - Encoder(encode_*): converts raw columns into feature column
+        -outputs: small integers in defined ranges (per-tier)
+    -internal helpers: shared math by all encoders )entropy/compression/hashing)
+    -orchestration:
+        - _build_feature_table: runs every encoder
+        - build_features: walks the parquet tree
 
-Vectorized encoders that map v0.2 parquet columns to dense ``uint8`` (or
-wider when needed) index arrays suitable for embedding lookup. Each
-categorical encoder reserves explicit sentinel indices for null inputs and
-out-of-vocabulary (OOV) values so the downstream model never sees a
-``null``.
-
-Tier coverage:
-
+feature coverage:
 * Tier 1 — categorical embeddings (event_type, kprobe_*, proc_uid_bucket).
+        - vocab(string) lookup -> int (buckets)
 * Tier 2 — bucketed scalars (dst_port, args_length, cap_count, path_sensitivity).
+        - range-bucketed (numeric) -> int(thresholds)
 * Tier 3 — hash buckets (proc_name, parent_proc, proc_cwd, lineage_bag_v1).
+        - variable-string hashes -> fixed N buckets
 * Tier 4 — boolean flags (in_init_tree, procfs_walk, uid_eq_parent_uid, ...).
+        - the inherited true/false fields
 * Tier 5 — derived continuous (cmdline entropy, gzip ratio, time_since_parent_exec).
+        - entropy/compression/time ->> bucketed
 * Tier 6 — kprobe-specific feature dicts (one per hooked function we feature).
-
-Implementation rules:
-
-* Vocabulary tables are module-level tuples; sentinel indices are exported
-  named constants so callers can build embedding tables of the right size
-  without re-deriving offsets.
-* All encoders accept either ``pyarrow.Table`` or ``pyarrow.RecordBatch``
-  and return a ``pyarrow.Array`` (or ``dict[str, pa.Array]`` for Tier 6).
-* No per-row Python iteration on full-corpus inputs unless absolutely
-  necessary (Tier 3 hashing and Tier 5 entropy/gzip are the only
-  exceptions; pyarrow has no vectorized hash or entropy compute).
+        - specific to kprobe characteristics
 
 The ``build_features`` orchestrator at the bottom wires the encoders together:
 it reads partitioned parquet from ``input_path``, applies all 27 Tier 1-6
@@ -70,7 +64,7 @@ KPROBE_FUNCTION_VOCAB: tuple[str, ...] = KPROBE_FUNCTIONS
 KPROBE_FUNCTION_NOT_KPROBE_INDEX: int = len(KPROBE_FUNCTION_VOCAB)  # 12
 KPROBE_FUNCTION_OOV_INDEX: int = KPROBE_FUNCTION_NOT_KPROBE_INDEX + 1  # 13
 
-# Six policies observed across V.1 of the v0.2 corpus (per design plan §3 V.1).
+#the 6 tetragon trace policies
 KPROBE_POLICY_VOCAB: tuple[str, ...] = (
     "file-monitor",
     "memory-monitor",
@@ -84,9 +78,7 @@ KPROBE_POLICY_OOV_INDEX: int = KPROBE_POLICY_NONE_INDEX + 1  # 7
 
 # Tetragon kprobe action enum: only KPROBE_ACTION_POST appears in the
 # v0.2 corpus (verified by full-corpus scan over data/processed/v0.2-split/).
-# Leave room for OOV so future Tetragon enum values (KPROBE_ACTION_FOLLOWFD,
-# KPROBE_ACTION_SIGKILL, KPROBE_ACTION_OVERRIDE, ...) collapse to a single
-# slot rather than crashing the encoder.
+# adds 1 to length for "OTHER/NONE"
 KPROBE_ACTION_VOCAB: tuple[str, ...] = ("KPROBE_ACTION_POST",)
 KPROBE_ACTION_NONE_INDEX: int = len(KPROBE_ACTION_VOCAB)  # 1
 KPROBE_ACTION_OOV_INDEX: int = KPROBE_ACTION_NONE_INDEX + 1  # 2
@@ -103,8 +95,7 @@ PROC_UID_BUCKET_OTHER: int = 4
 
 # dst_port bucket assignments — closed set 0..6.
 # `loopback` slot is reserved for dport == 0 (Tetragon emits 0 for loopback /
-# unset dport in some kprobe paths); empirical verification on the v0.2
-# corpus is part of the Phase-1 smoke checks.
+# unset dport in some kprobe paths)
 DST_PORT_BUCKET_NONE: int = 0
 DST_PORT_BUCKET_LOOPBACK: int = 1
 DST_PORT_BUCKET_SSH: int = 2
@@ -130,7 +121,8 @@ CAP_COUNT_BUCKET_6_15: int = 3
 CAP_COUNT_BUCKET_16PLUS: int = 4
 
 # path_sensitivity bucket assignments — closed set 0..7. Order MUST match
-# the spec §5 path_sensitivity table; first-match wins.
+# the path_sensitivity table 
+# # first-match wins: more-specific buckets come first so they win over generic ones
 PATH_SENSITIVITY_SENSITIVE_SYS: int = 0
 PATH_SENSITIVITY_STAGING: int = 1
 PATH_SENSITIVITY_RUNTIME: int = 2
@@ -152,11 +144,10 @@ _PATH_RUNTIME_PREFIXES: tuple[str, ...] = (
 _PATH_USER_HOME_PREFIXES: tuple[str, ...] = (
     "/home/", "/Users/",
 )
-# proc_self vs runtime: spec calls /proc/self/ proc_self and /proc/<pid>/
-# (where pid != current pid) runtime. For v0.2 we approximate: anything that
-# starts with /proc/self/ is proc_self; everything else under /proc/ that is
-# /proc/<digits>/ is runtime. We do not compare PIDs (no per-row context),
-# which is documented as acceptable in the task brief.
+# proc_self vs runtime: 
+# proc_Self: the current process looking at its own runtime info
+# runtime: one process is poking at a different process's runtime info
+#   - cross memory inspection without ptrace
 _PATH_PROC_SELF_PREFIX: str = "/proc/self/"
 _PATH_PROC_NUMERIC_REGEX: str = r"^/proc/[0-9]+/"
 _PATH_VSCODE_DEV_SUBSTRINGS: tuple[str, ...] = (
@@ -166,17 +157,42 @@ _PATH_VSCODE_DEV_SUBSTRINGS: tuple[str, ...] = (
 
 # ---------- Tier 3 hash bucket sizes ----------
 
-PROC_NAME_HASH_BUCKETS: int = 2048   # was 1024 (3a': 27.7% collision per audit cell 43)
+PROC_NAME_HASH_BUCKETS: int = 2048   # was 1024 (27.7% collision per audit cell 43)
 PARENT_PROC_HASH_BUCKETS: int = 1024
-PROC_CWD_HASH_BUCKETS: int = 4096    # was 256 (3a': 90.2% collision per audit cell 43)
+PROC_CWD_HASH_BUCKETS: int = 4096    # was 256 (90.2% collision per audit cell 43)
 LINEAGE_BAG_HASH_V1_BUCKETS: int = 256
 
 
 # ---------- Tier 5 vocab / sentinel constants ----------
 
+"""
+shannon entropy of the argv characters
+    - measures how spread out the character distribution is
+    - "" (empty) -- entropy = 0.0 (no args)
+    - "-c 'echo hello world'" -- entropy = 3.0-4.0
+    - random/encrypted blob: entropy=6.0+
+
+Compression: same pipeline as entropy but measures the gzip size of an argv string
+    - divides compressed size by original size in _compression_ratio()
+
+low ratio: <<1.0 --> string compressed a lot (lots of repetition/structure)
+high ratio: 1.0+ ---> string barely compressed (random/dense)
+
+example:
+    - "-la" -- compression: ~3.0: tiny string, gzip header dominates
+    - structured json: data='{\"k\":1,\"k\":2,\"k\":3,...}'" -- repeated keys, very compressable
+
+Compression + entropy together:
+    - 
+Argv pattern	                    Entropy	        Compression	            What it tells you
+"hello hello hello hello hello"	    LOW (~2.5)	    VERY (~0.4)	            repetitive low-info text
+Long base64 payload	                HIGH (~5.8)	    WEAK (~0.75)	        encoded payload with structure
+AES-encrypted blob (base64'd)	    HIGH (~5.9)	    INCOMPRESSIBLE (~0.95)	true random-looking data
+"ls -la"	                           LOW (~2.3)	INCOMPRESSIBLE (~3.0)	normal short command (artifact of gzip overhead)
+"""
 # cmdline_entropy bucket assignments — closed set 0..5 (plus null sentinel 0).
 # Indices: null=0, low<2.0, mid_low<3.5, mid<4.5, mid_high<5.5, high>=5.5.
-CMDLINE_ENTROPY_NULL: int = 0
+CMDLINE_ENTROPY_NULL: int = 0 #null if a process has no arguments at all -- like ls
 CMDLINE_ENTROPY_LOW: int = 1
 CMDLINE_ENTROPY_MID_LOW: int = 2
 CMDLINE_ENTROPY_MID: int = 3
@@ -212,8 +228,6 @@ SOCK_FAMILY_OOV_INDEX: int = SOCK_FAMILY_NONE_INDEX + 1  # 3
 
 
 # ---------- internal helpers ----------
-
-
 def _column(table: ArrowTabular, name: str) -> pa.Array | pa.ChunkedArray:
     """Fetch a column from either a Table or a RecordBatch."""
     if isinstance(table, pa.RecordBatch):

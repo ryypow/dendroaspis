@@ -6,8 +6,7 @@ seven Plan G lineage / action columns, and the four 3a' promoted-
 to-model categorical columns (f_path_category, f_dst_ip_category,
 f_dst_port_category, f_object_category). Each column gets its own
 embedding table or float pass-through; concatenated and projected to
-``d_model``. Authoritative current-state listing is in
-``docs/releases/v0.2-course-milestone/v0.2_encoder_design_final.md``.
+``d_model``.
 
 Cardinalities are pulled from the constants in
 ``src.features.v0_2_features`` and ``src.processing.v0_2_behavior_builder``

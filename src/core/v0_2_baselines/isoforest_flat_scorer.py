@@ -6,7 +6,7 @@ the reduced ``TABULAR_FEATURE_COLUMNS_FLAT`` set (35 cols = 26 embed +
 columns are the high-cardinality hashes: see
 ``EXCLUDED_FLAT_HASH_COLUMNS`` in ``shared.py``.
 
-Purpose: §6 decomposition of Mamba MEM-FA's 0.085 AUROC lift over
+Purpose: decomposition of Mamba MEM-FA's 0.085 AUROC lift over
 IF-rich-v0.2 into "encoder hash richness" vs "sequence body +
 field-aware reconstruction". A separate scorer class (rather than a
 column flag on the rich one) keeps the saved ``baseline.pkl`` and CLI

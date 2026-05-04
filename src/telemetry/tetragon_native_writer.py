@@ -1,15 +1,27 @@
 """Tetragon-native parquet writer.
 
-Holds the locked raw-event SCHEMA literal (§2.2) and a single-output
-writer that accumulates raw parser rows across multiple parse_file()
-calls and writes one parquet at the path the caller specifies. The
-on-disk schema is the raw event SCHEMA below (no feature computation).
+Writes the raw-event schema for the train/test parquets (no feature computation)
+    - feature computation is handled at the next stage (v0_2_behavior_builder.py)
 
-Feature computation is a downstream stage in v0_2_behavior_builder, which
-reads the raw parquet, joins lineage / categories / tokens, and runs
-_build_feature_table for the 33 f_* features. Keeping raw and feature
-parquets separate preserves a re-encodable raw artifact and lets lineage
-features see global state across all files.
+Schema groups: 
+A — Event envelope: type, ns timestamp, host node name. Three columns; always populated.
+B — Process identity: exec_id (stable), pid/tid, uid/auid, binary, argv, cwd, flags, start_time.
+     Emitted under both "proc_" (the process that triggered the event) and "parent_" prefixes.
+C — Tetragon flag booleans split out from the raw flags string: is_procfs_walk (startup
+     /proc backfill — not a real-time exec), flag_execve, flag_clone, flag_rootcwd.
+D — Process security context: linux capabilities (permitted/effective/inheritable), the seven
+     namespace inums plus is_host bits for pid/user/time, and the four-way credential set
+     (real/effective/saved-set/filesystem uid+gid). Mirrored under proc_ and parent_.
+F — Event-type-specific scalars: exit_status/exit_signal (process_exit only),
+     kprobe_function_name / policy_name / action / return_action (process_kprobe only).
+     Null for the other event types.
+G — Kprobe argument extractions, namespaced kp_<probe>_<field>. Sparse by design: only the
+     subset matching kprobe_function_name is populated per row, all others null. The shared
+     kp_sock_* block backs the four network probes. kprobe_args_json is the raw-arg safety
+     net — always populated for kprobe events so missed extractions can be recovered later.
+H — Provenance: source filename, source line number, parser version. For audit/debug only;
+     not used by the encoder.
+
 """
 
 from __future__ import annotations

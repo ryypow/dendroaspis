@@ -19,7 +19,7 @@ Both variants stack ``n_layers`` MambaBlocks with pre-norm residual:
 
     x = x + block(norm(x))
 
-The v0.1 body was tuned at L=128 / d_model=64; Plan E v2 keeps L=128 and
+The v0.1 body was tuned at L=128 / d_model=64; v2 keeps L=128 and
 bumps d_model to 128 to accommodate the larger encoder concat dim.
 """
 
@@ -40,7 +40,7 @@ from src.processing.v0_2_behavior_builder import (
 )
 
 
-# 3a.1 — field-aware categorical MEM heads. CE on each named categorical
+# field-aware categorical MEM heads. CE on each named categorical
 # field, BCE on each named binary flag. The encoder embedding for each
 # masked position is replaced with the [MASK] token before the body, so
 # the body cannot peek at the field values; each head must reconstruct
@@ -302,7 +302,7 @@ class MambaMEMScorer(nn.Module):
 
 
 class MambaFieldAwareMEMScorer(nn.Module):
-    """3a.1 — field-aware categorical MEM.
+    """field-aware categorical MEM.
 
     Replaces vanilla MEM's monolithic ``Linear(d_model, d_model)`` MSE
     head with **per-field** heads:
