@@ -16,7 +16,7 @@ Proxmox/LXC developer-workstation environment.
 
 Dendroaspis is the genus of mamba snakes. The project is named for the Mamba architecture (Gu & Dao, 2023) — itself a nod to the hiss of S-words in its design (Selective State Space, S6, Scan) and to the snake's reputation for speed.
 <p align="center">
-  <img src="black_mamba.png" alt="Black mamba (Dendroaspis polylepis)" width="400">
+  <img src="black_mamba.png" alt="Black mamba (Dendroaspis polylepis)" width="960">
 </p>
 ---
 
